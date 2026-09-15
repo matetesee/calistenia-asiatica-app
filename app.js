@@ -19,7 +19,10 @@
       lastCompletedDate: null,
       photos: [], // {dataUrl, date}
       savedRecipes: [],
-      weightLog: [], // {date, weight}
+      recipeMadeCount: {}, // recipeId -> veces preparada
+      weightLog: [], // {date, weight} en kg, siempre en orden cronologico (push = mas nuevo al final)
+      weightUnit: "kg", // "kg" | "lb", solo afecta como se muestra
+      goalWeight: null, // kg
       habitLog: {}, // "YYYY-MM-DD" -> {habitId: true}
       unlockedBadges: [],
     };
@@ -48,7 +51,7 @@
   // ---------------------------------------------------------------------
   // Navegacion (sin framework: un pequeño router por estado)
   // ---------------------------------------------------------------------
-  const nav = { tab: "home", detail: null, modalDay: null };
+  const nav = { tab: "home", detail: null, modalDay: null, settingsOpen: false };
 
   function go(tab) {
     nav.tab = tab;
@@ -72,6 +75,14 @@
   }
   function closeDayModal() {
     nav.modalDay = null;
+    render();
+  }
+  function openSettings() {
+    nav.settingsOpen = true;
+    render();
+  }
+  function closeSettings() {
+    nav.settingsOpen = false;
     render();
   }
 
@@ -198,6 +209,7 @@
         </div>
         <div class="hdr-actions">
           <div class="streak-pill">\u{1F525} ${state.currentStreak}</div>
+          <button class="icon-btn" id="settings-btn" aria-label="Configuración">\u{2699}\u{FE0F}</button>
         </div>
       </header>`;
   }
@@ -460,24 +472,41 @@
   let expandedRecipe = null;
 
   function renderRecetas() {
-    const filtered = activeTag === "todas" ? D.RECIPES : D.RECIPES.filter((r) => r.tag === activeTag);
+    let filtered;
+    if (activeTag === "todas") filtered = [...D.RECIPES];
+    else if (activeTag === "guardadas") filtered = D.RECIPES.filter((r) => state.savedRecipes.includes(r.id));
+    else filtered = D.RECIPES.filter((r) => r.tag === activeTag);
+
+    // Las guardadas siempre primero (salvo que ya estemos filtrando solo por guardadas).
+    if (activeTag !== "guardadas") {
+      filtered.sort((a, b) => (state.savedRecipes.includes(b.id) ? 1 : 0) - (state.savedRecipes.includes(a.id) ? 1 : 0));
+    }
+
+    const savedCount = state.savedRecipes.length;
     const chips = [
       `<button class="tag-chip ${activeTag === "todas" ? "active" : ""}" data-tag="todas">Todas</button>`,
+      `<button class="tag-chip ${activeTag === "guardadas" ? "active" : ""}" data-tag="guardadas">\u{2764}\u{FE0F} Guardadas${savedCount ? ` (${savedCount})` : ""}</button>`,
       ...Object.entries(D.RECIPE_TAGS).map(
         ([id, t]) => `<button class="tag-chip ${activeTag === id ? "active" : ""}" data-tag="${id}">${t.icon} ${escapeHtml(t.label)}</button>`
       ),
     ].join("");
+
+    const emptyState =
+      activeTag === "guardadas" && filtered.length === 0
+        ? `<div class="card" style="text-align:center;"><div style="font-size:1.6rem;">\u{2764}\u{FE0F}</div><p style="margin-top:.4rem;font-size:.85rem;color:var(--text-muted);">Todavía no guardaste ninguna receta. Tocá "Guardar" en la que más te guste.</p></div>`
+        : "";
 
     const cards = filtered
       .map((r) => {
         const tag = D.RECIPE_TAGS[r.tag];
         const isOpen = expandedRecipe === r.id;
         const isSaved = state.savedRecipes.includes(r.id);
+        const madeCount = state.recipeMadeCount[r.id] || 0;
         return `<div class="recipe-card">
           <div class="recipe-head" data-recipe="${r.id}">
             <div>
-              <div class="recipe-name">${escapeHtml(r.name)}</div>
-              <div class="recipe-tag">${tag.icon} ${escapeHtml(tag.label)}</div>
+              <div class="recipe-name">${isSaved ? "\u{2764}\u{FE0F} " : ""}${escapeHtml(r.name)}</div>
+              <div class="recipe-tag">${tag.icon} ${escapeHtml(tag.label)}${madeCount ? ` · preparada ${madeCount}x` : ""}</div>
             </div>
             <div>${isOpen ? "▲" : "▼"}</div>
           </div>
@@ -505,7 +534,8 @@
         <h1 class="page-title">Té Asiático Anticelulite</h1>
         <p class="page-sub">Biblioteca de recetas interactiva</p>
         <div class="tag-scroll">${chips}</div>
-        <p style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem;">${filtered.length} recetas</p>
+        <p style="font-size:.78rem;color:var(--text-muted);margin-bottom:.8rem;">${filtered.length} receta${filtered.length === 1 ? "" : "s"}</p>
+        ${emptyState}
         ${cards}
       </main>`;
   }
@@ -513,42 +543,115 @@
   // ---------------------------------------------------------------------
   // Detalle: Plan de Progreso (peso)
   // ---------------------------------------------------------------------
-  function renderPlanProgreso() {
-    const entries = [...state.weightLog].sort((a, b) => (a.date < b.date ? 1 : -1));
-    const rows = entries
-      .map((e) => `<div class="simple-row"><span>${escapeHtml(e.date)}</span><strong>${e.weight} kg</strong></div>`)
-      .join("");
+  function kgToDisplay(kg) {
+    return state.weightUnit === "lb" ? kg * 2.20462 : kg;
+  }
+  function displayToKg(val) {
+    return state.weightUnit === "lb" ? val / 2.20462 : val;
+  }
+  function fmtWeight(kg) {
+    return `${kgToDisplay(kg).toFixed(1)} ${state.weightUnit}`;
+  }
 
-    let sparkline = "";
-    if (entries.length >= 2) {
-      const asc = [...entries].reverse();
+  function renderPlanProgreso() {
+    // state.weightLog esta siempre en orden cronologico ascendente (se hace push al guardar),
+    // asi que lo usamos directo para el grafico y lo invertimos solo para mostrar la lista.
+    const asc = state.weightLog.map((e, idx) => ({ ...e, idx }));
+    const desc = [...asc].reverse();
+
+    let chart = "";
+    if (asc.length >= 2) {
       const weights = asc.map((e) => e.weight);
-      const min = Math.min(...weights), max = Math.max(...weights);
+      const min = Math.min(...weights);
+      const max = Math.max(...weights);
       const range = max - min || 1;
-      const pts = asc
-        .map((e, i) => {
-          const x = (i / (asc.length - 1)) * 280 + 10;
-          const y = 70 - ((e.weight - min) / range) * 60;
-          return `${x},${y}`;
-        })
-        .join(" ");
-      sparkline = `<svg viewBox="0 0 300 80" width="100%" height="80"><polyline points="${pts}" fill="none" stroke="var(--primary)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+      const pad = 10;
+      const w = 280;
+      const points = asc.map((e, i) => {
+        const x = (i / (asc.length - 1)) * w + pad;
+        const y = 70 - ((e.weight - min) / range) * 55 - 2;
+        return { x, y };
+      });
+      const lineStr = points.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+      const dots = points
+        .map((p) => `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4" fill="var(--primary-dark)" />`)
+        .join("");
+      const first = asc[0], last = asc[asc.length - 1];
+      const diff = last.weight - first.weight;
+      const diffLabel = diff <= 0 ? `\u{2193} ${Math.abs(kgToDisplay(diff)).toFixed(1)} ${state.weightUnit}` : `\u{2191} ${kgToDisplay(diff).toFixed(1)} ${state.weightUnit}`;
+      const diffColor = diff <= 0 ? "var(--green)" : "var(--primary)";
+      chart = `
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:.4rem;">
+          <div style="font-size:.72rem;color:var(--text-muted);">Desde ${escapeHtml(first.date)}</div>
+          <div style="font-weight:800;color:${diffColor};font-size:.9rem;">${diffLabel}</div>
+        </div>
+        <svg viewBox="0 0 300 80" width="100%" height="90">
+          <polyline points="${lineStr}" fill="none" stroke="var(--primary)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          ${dots}
+        </svg>
+        <div style="display:flex;justify-content:space-between;font-size:.7rem;color:var(--text-muted);">
+          <span>${fmtWeight(min)}</span><span>${fmtWeight(max)}</span>
+        </div>`;
+    } else if (asc.length === 1) {
+      chart = `<p style="font-size:.8rem;color:var(--text-muted);">Cargá un segundo registro (otro día) para ver tu gráfico de evolución.</p>`;
+    } else {
+      chart = `<p style="font-size:.8rem;color:var(--text-muted);">Cargá al menos 2 registros para ver tu gráfico.</p>`;
     }
+
+    let goalBlock = "";
+    if (state.goalWeight) {
+      const current = asc.length ? asc[asc.length - 1].weight : null;
+      const reached = current != null && current <= state.goalWeight;
+      goalBlock = `
+        <div class="card-flat" style="margin-bottom:.9rem;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <div style="font-size:.8rem;font-weight:700;">\u{1F3AF} Meta: ${fmtWeight(state.goalWeight)}</div>
+            <button class="btn-ghost" id="clear-goal" style="padding:0;font-size:.72rem;">Quitar</button>
+          </div>
+          ${
+            current == null
+              ? ""
+              : reached
+              ? `<div style="font-size:.8rem;color:var(--green);font-weight:700;margin-top:.3rem;">\u{1F389} ¡Llegaste a tu meta!</div>`
+              : `<div style="font-size:.8rem;color:var(--text-muted);margin-top:.3rem;">Te faltan ${fmtWeight(current - state.goalWeight)} para llegar.</div>`
+          }
+        </div>`;
+    } else {
+      goalBlock = `
+        <div class="card-flat" style="margin-bottom:.9rem;">
+          <div style="font-size:.8rem;font-weight:700;margin-bottom:.5rem;">\u{1F3AF} Definir meta de peso (opcional)</div>
+          <div style="display:flex;gap:.5rem;">
+            <input type="number" step="0.1" class="text-input" id="goal-input" placeholder="Meta en ${state.weightUnit}" style="margin-bottom:0;">
+            <button class="btn-secondary" id="save-goal" style="width:auto;padding:0 1rem;white-space:nowrap;">Guardar</button>
+          </div>
+        </div>`;
+    }
+
+    const rows = desc
+      .map(
+        (e) => `<div class="simple-row">
+          <span>${escapeHtml(e.date)}</span>
+          <span style="display:flex;align-items:center;gap:.6rem;">
+            <strong>${fmtWeight(e.weight)}</strong>
+            <button data-del-weight="${e.idx}" style="color:var(--text-muted);font-size:.9rem;">✕</button>
+          </span>
+        </div>`
+      )
+      .join("");
 
     return `
       <main class="view">
         <button class="btn-ghost" id="back-btn">‹ Volver</button>
         <h1 class="page-title">Plan de Progreso</h1>
         <p class="page-sub">Registrá tu peso y mirá tu evolución</p>
-        <div class="card">
-          ${sparkline || '<p style="font-size:.8rem;color:var(--text-muted);">Cargá al menos 2 registros para ver tu gráfico.</p>'}
-        </div>
+        <div class="card">${chart}</div>
+        ${goalBlock}
         <div class="card">
           <div style="font-weight:800;font-size:.88rem;margin-bottom:.6rem;">Nuevo registro</div>
-          <input type="number" step="0.1" class="text-input" id="weight-input" placeholder="Tu peso hoy (kg)" style="margin-bottom:.6rem;">
+          <input type="number" step="0.1" class="text-input" id="weight-input" placeholder="Tu peso hoy (${state.weightUnit})" style="margin-bottom:.6rem;">
           <button class="btn-primary" id="save-weight">Guardar registro</button>
         </div>
-        ${entries.length ? `<div class="card">${rows}</div>` : ""}
+        ${desc.length ? `<div class="card">${rows}</div>` : ""}
       </main>`;
   }
 
@@ -719,12 +822,6 @@
         </div>
 
         <div class="info-block">
-          <h3>Soporte</h3>
-          <p>¿Tenés dudas o necesitás ayuda? Escribinos, respondemos todos los días.</p>
-          <button class="btn-secondary" style="margin-top:.6rem;">Contactar soporte</button>
-        </div>
-
-        <div class="info-block">
           <h3>Invitá a una amiga</h3>
           <p>¿Conocés a alguien que necesite este empujón? Mandale el link.</p>
           <button class="btn-secondary" style="margin-top:.6rem;" id="share-link">\u{1F465} Invitar a una amiga</button>
@@ -788,6 +885,41 @@
   }
 
   // ---------------------------------------------------------------------
+  // Modal: configuracion (nombre, foto, unidad, reiniciar)
+  // ---------------------------------------------------------------------
+  function renderSettingsModal() {
+    if (!nav.settingsOpen) return "";
+    const avatar = state.avatar ? `<img src="${state.avatar}" alt="">` : "\u{1F338}";
+    return `
+      <div class="modal-overlay" id="settings-overlay">
+        <div class="modal-sheet">
+          <button class="modal-close" id="settings-close">✕</button>
+          <h1 class="page-title" style="margin-top:.5rem;">\u{2699}\u{FE0F} Configuración</h1>
+
+          <div style="text-align:center;margin:1rem 0;">
+            <div class="photo-picker" id="settings-picker" style="width:80px;height:80px;">
+              <span id="settings-picker-inner" style="${state.avatar ? "" : "font-size:1.6rem;"}">${avatar}</span>
+            </div>
+            <input type="file" id="settings-file-input" accept="image/*" style="display:none">
+          </div>
+
+          <div style="font-weight:700;font-size:.82rem;margin-bottom:.4rem;">Tu nombre</div>
+          <input type="text" class="text-input" id="settings-name-input" value="${escapeHtml(state.name)}" maxlength="30" style="margin-bottom:1rem;">
+
+          <div style="font-weight:700;font-size:.82rem;margin-bottom:.4rem;">Unidad de peso</div>
+          <div class="platform-toggle" style="margin-bottom:1.2rem;">
+            <button data-unit="kg" class="${state.weightUnit === "kg" ? "active" : ""}">Kilos (kg)</button>
+            <button data-unit="lb" class="${state.weightUnit === "lb" ? "active" : ""}">Libras (lb)</button>
+          </div>
+
+          <button class="btn-primary" id="settings-save" style="margin-bottom:.8rem;">Guardar cambios</button>
+          <button class="btn-secondary" id="settings-reset" style="color:var(--primary-dark);">Reiniciar progreso</button>
+          <div class="footer-note">Calistenia Asiática. Uso personal exclusivo.</div>
+        </div>
+      </div>`;
+  }
+
+  // ---------------------------------------------------------------------
   // Render principal + wiring de eventos
   // ---------------------------------------------------------------------
   function render() {
@@ -806,7 +938,7 @@
     else if (nav.tab === "info") html = renderInfo();
     else html = renderHome();
 
-    $app.innerHTML = html + renderDayModal();
+    $app.innerHTML = html + renderDayModal() + renderSettingsModal();
     wireEvents();
 
     if (pendingBadgeToast) {
@@ -901,7 +1033,14 @@
       })
     );
     $app.querySelectorAll("[data-made]").forEach((btn) =>
-      btn.addEventListener("click", (e) => { e.stopPropagation(); showToast("¡Buen provecho! \u{1F375}"); })
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.made;
+        state.recipeMadeCount[id] = (state.recipeMadeCount[id] || 0) + 1;
+        saveState();
+        showToast(`¡Buen provecho! La preparaste ${state.recipeMadeCount[id]}x \u{1F375}`);
+        openDetail("recetas");
+      })
     );
 
     // Plan de progreso: peso
@@ -911,7 +1050,35 @@
         const input = document.getElementById("weight-input");
         const val = parseFloat(input.value);
         if (!val || val <= 0) return;
-        state.weightLog.push({ date: todayISO(), weight: val });
+        state.weightLog.push({ date: todayISO(), weight: displayToKg(val) });
+        checkBadges();
+        saveState();
+        openDetail("plan-progreso");
+      });
+    }
+    $app.querySelectorAll("[data-del-weight]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        const idx = Number(btn.dataset.delWeight);
+        state.weightLog.splice(idx, 1);
+        saveState();
+        openDetail("plan-progreso");
+      })
+    );
+    const saveGoal = document.getElementById("save-goal");
+    if (saveGoal) {
+      saveGoal.addEventListener("click", () => {
+        const input = document.getElementById("goal-input");
+        const val = parseFloat(input.value);
+        if (!val || val <= 0) return;
+        state.goalWeight = displayToKg(val);
+        saveState();
+        openDetail("plan-progreso");
+      });
+    }
+    const clearGoal = document.getElementById("clear-goal");
+    if (clearGoal) {
+      clearGoal.addEventListener("click", () => {
+        state.goalWeight = null;
         saveState();
         openDetail("plan-progreso");
       });
@@ -926,6 +1093,63 @@
         saveState();
       })
     );
+
+    // Configuracion (engranaje)
+    const settingsBtn = document.getElementById("settings-btn");
+    if (settingsBtn) settingsBtn.addEventListener("click", openSettings);
+    const settingsOverlay = document.getElementById("settings-overlay");
+    const settingsClose = document.getElementById("settings-close");
+    if (settingsClose) settingsClose.addEventListener("click", closeSettings);
+    if (settingsOverlay) settingsOverlay.addEventListener("click", (e) => { if (e.target === settingsOverlay) closeSettings(); });
+
+    const settingsPicker = document.getElementById("settings-picker");
+    const settingsFileInput = document.getElementById("settings-file-input");
+    if (settingsPicker) settingsPicker.addEventListener("click", () => settingsFileInput.click());
+    if (settingsFileInput) {
+      settingsFileInput.addEventListener("change", () => {
+        const f = settingsFileInput.files[0];
+        if (!f) return;
+        resizeImageToDataUrl(f, 300, (dataUrl) => {
+          state.avatar = dataUrl;
+          saveState();
+          document.getElementById("settings-picker-inner").outerHTML = `<img src="${dataUrl}" alt="">`;
+        });
+      });
+    }
+
+    $app.querySelectorAll("[data-unit]").forEach((b) =>
+      b.addEventListener("click", () => {
+        state.weightUnit = b.dataset.unit;
+        saveState();
+        render();
+      })
+    );
+
+    const settingsSave = document.getElementById("settings-save");
+    if (settingsSave) {
+      settingsSave.addEventListener("click", () => {
+        const nameInput = document.getElementById("settings-name-input");
+        const newName = nameInput.value.trim();
+        if (newName) state.name = newName;
+        saveState();
+        closeSettings();
+        showToast("Cambios guardados \u{2728}");
+      });
+    }
+    const settingsReset = document.getElementById("settings-reset");
+    if (settingsReset) {
+      settingsReset.addEventListener("click", () => {
+        if (!window.confirm("¿Reiniciar todo tu progreso? Esto borra días completados, logros, fotos y registros. Tu nombre y foto se mantienen.")) return;
+        const keepName = state.name;
+        const keepAvatar = state.avatar;
+        const keepUnit = state.weightUnit;
+        state = Object.assign(defaultState(), { onboarded: true, name: keepName, avatar: keepAvatar, weightUnit: keepUnit });
+        saveState();
+        closeSettings();
+        go("home");
+        showToast("Progreso reiniciado \u{1F343}");
+      });
+    }
   }
 
   render();
